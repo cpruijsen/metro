@@ -53,6 +53,11 @@ import {
   vlqMapFromTuples,
 } from 'metro-source-map';
 import metroTransformPlugins from 'metro-transform-plugins';
+import {
+  METRO_BABEL_RUNTIME_MODULE_NAME,
+  getMetroBabelRuntimePackageJsonPath,
+  getMetroBabelRuntimeVersion,
+} from 'metro/private/lib/metroBabelRuntime';
 import collectDependencies from 'metro/private/ModuleGraph/worker/collectDependencies';
 import generateImportNames from 'metro/private/ModuleGraph/worker/generateImportNames';
 import {
@@ -175,6 +180,9 @@ export type JsOutput = Readonly<{
     lineCount: number,
     map: VlqMap,
     functionMap: ?FBSourceFunctionMap,
+    // Assets only: the URL path the code was generated with. A temporary
+    // migration helper, to be removed.
+    unstable_assetUrlPath?: string,
   }>,
   type: JSFileType,
 }>;
@@ -534,12 +542,13 @@ async function transformAsset(
   context: TransformationContext,
 ): Promise<TransformResponse> {
   const {assetRegistryPath, assetPlugins} = context.config;
+  const urlPath = context.assetUrlPath ?? file.filename;
 
   const result = await assetTransformer.transform(
     getBabelTransformArgs(file, context),
     assetRegistryPath,
     assetPlugins,
-    context.assetUrlPath ?? undefined,
+    urlPath,
   );
 
   const jsFile = {
@@ -549,7 +558,14 @@ async function transformAsset(
     type: 'js/module/asset' as const,
   };
 
-  return transformJS(jsFile, context);
+  const response = await transformJS(jsFile, context);
+  return {
+    ...response,
+    output: response.output.map(output => ({
+      ...output,
+      data: {...output.data, unstable_assetUrlPath: urlPath},
+    })),
+  };
 }
 
 /**
@@ -662,6 +678,12 @@ function getBabelTransformArgs(
     filename: file.filename, // System-separated, project-root-relative
     options: {
       ...babelTransformerOptions,
+      ...(config.enableBabelRuntime === true
+        ? {
+            babelRuntimeModuleName: METRO_BABEL_RUNTIME_MODULE_NAME,
+            babelRuntimeVersion: getMetroBabelRuntimeVersion(),
+          }
+        : null),
       enableBabelRCLookup: config.enableBabelRCLookup,
       enableBabelRuntime: config.enableBabelRuntime,
       globalPrefix: config.globalPrefix,
@@ -761,9 +783,16 @@ export const getCacheKey = (
     require.resolve(minifierPath),
     require.resolve('./utils/getMinifier'),
     require.resolve('./utils/assetTransformer'),
+    require.resolve('metro/private/ModuleGraph/worker/collectDependencies'),
     require.resolve('metro/private/ModuleGraph/worker/generateImportNames'),
     require.resolve('metro/private/ModuleGraph/worker/JsFileWrapping'),
+    require.resolve('metro/private/ModuleGraph/worker/importLocationsPlugin'),
     ...metroTransformPlugins.getTransformPluginCacheKeyFiles(),
+    // Transform output depends on the installed version of Metro's own
+    // `@babel/runtime`, which is read from its `package.json`.
+    ...(config.enableBabelRuntime === true
+      ? [getMetroBabelRuntimePackageJsonPath()]
+      : []),
   ]);
 
   // $FlowFixMe[unsupported-syntax]

@@ -215,6 +215,8 @@ jest.mock('fs', () => ({
       }
       return entry.link;
     }),
+    // No root in the mock file system is a symlink.
+    realpath: jest.fn(async path => path),
   },
 }));
 jest.mock('node:fs', () => jest.requireMock('fs'));
@@ -345,7 +347,7 @@ describe('FileMap', () => {
     // $FlowFixMe[incompatible-type]
     mockChangedFiles = null;
 
-    fs = require('graceful-fs');
+    fs = require('node:fs');
 
     consoleWarn = console.warn;
     consoleError = console.error;

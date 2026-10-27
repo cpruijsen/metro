@@ -68,10 +68,10 @@ import symbolicate from './Server/symbolicate';
 import {SourcePathsMode} from './shared/types';
 import {codeFrameColumns} from '@babel/code-frame';
 import debugModule from 'debug';
-import * as fs from 'graceful-fs';
 import * as jscSafeUrl from 'jsc-safe-url';
 import {Logger} from 'metro-core';
 import mime from 'mime-types';
+import fs from 'node:fs';
 import path from 'node:path';
 import {performance} from 'node:perf_hooks';
 import querystring from 'node:querystring';
@@ -444,8 +444,6 @@ export default class Server {
       platform,
       projectRoot: this._config.projectRoot,
       publicPath: this._config.transformer.publicPath,
-      watchFolders: this._config.watchFolders,
-      dynamicRoots: this._bundler.getBundler().getDynamicRoots(),
     });
   }
 
@@ -1176,10 +1174,11 @@ export default class Server {
       };
     },
     finish({req, mres, serializerOptions, result, bundlePerfLogger}) {
+      const bundleByteLength = Buffer.byteLength(result.bundle);
       bundlePerfLogger.annotate({
         int: {
           bundle_length: result.bundle.length,
-          bundle_byte_length: Buffer.byteLength(result.bundle),
+          bundle_byte_length: bundleByteLength,
         },
       });
       mres.once('error', () => {
@@ -1219,10 +1218,7 @@ export default class Server {
         }
         mres.setHeader('Content-Type', 'application/javascript; charset=UTF-8');
         mres.setHeader('Last-Modified', result.lastModifiedDate.toUTCString());
-        mres.setHeader(
-          'Content-Length',
-          String(Buffer.byteLength(result.bundle)),
-        );
+        mres.setHeader('Content-Length', String(bundleByteLength));
         mres.end(result.bundle);
       }
     },

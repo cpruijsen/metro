@@ -30,12 +30,17 @@ jest
 
 import type {JsTransformerConfig, JsTransformOptions} from '../index';
 import typeof * as TransformerType from '../index';
+import type {
+  BabelTransformer,
+  BabelTransformerArgs,
+} from 'metro-babel-transformer';
 import typeof FSType from 'node:fs';
 
 const {
   posixToSystemPath: p,
 } = require('metro-resolver/private/__tests__/utils');
 const {Buffer} = require('node:buffer');
+const path = require('node:path');
 
 const babelTransformerPath =
   require.resolve('@react-native/metro-babel-transformer');
@@ -157,6 +162,30 @@ test('uses the indexed watch folder path for asset URLs', async () => {
   expect(result.output[0].data.code).toContain(
     '"httpServerLocation": "/assets/[metro-watchFolders]/1"',
   );
+  expect(result.output[0].data.unstable_assetUrlPath).toBe(
+    '[metro-watchFolders]/1/test.mp4',
+  );
+});
+
+test('reports the project-relative URL path of an asset given no URL path', async () => {
+  fs.mkdirSync(p('/root/external'), {recursive: true});
+  fs.writeFileSync(p('/root/external/test.mp4'), 'asset data');
+
+  const result = await Transformer.transform(
+    baseConfig,
+    p('/root'),
+    'external/test.mp4',
+    Buffer.from('asset data'),
+    {
+      ...baseTransformOptions,
+      type: 'asset',
+    },
+  );
+
+  expect(result.output[0].data.code).toContain(
+    '"httpServerLocation": "/assets/external"',
+  );
+  expect(result.output[0].data.unstable_assetUrlPath).toBe('external/test.mp4');
 });
 
 test('transforms a module with dependencies', async () => {
@@ -303,6 +332,57 @@ test('does not add "use strict" on non-modules', async () => {
     [HEADER_DEV, '  module.exports = {};', '});'].join('\n'),
   );
 });
+
+function mockBabelTransformer(): JestMockFn<
+  [BabelTransformerArgs],
+  ReturnType<BabelTransformer['transform']>,
+> {
+  const actual = jest.requireActual<BabelTransformer>(babelTransformerPath);
+  const transform = jest.fn(actual.transform);
+  jest.doMock(babelTransformerPath, () => ({...actual, transform}));
+  return transform;
+}
+
+test("passes Metro's own Babel runtime when enableBabelRuntime is true", async () => {
+  const babelTransform = mockBabelTransformer();
+  const {version} = jest.requireActual<{version: string, ...}>(
+    require.resolve('@babel/runtime/package.json', {
+      paths: [path.dirname(require.resolve('metro-runtime/package.json'))],
+    }),
+  );
+
+  await Transformer.transform(
+    baseConfig,
+    '/root',
+    'local/file.js',
+    Buffer.from('arbitrary(code)', 'utf8'),
+    baseTransformOptions,
+  );
+
+  expect(babelTransform.mock.calls[0][0].options).toMatchObject({
+    babelRuntimeModuleName: 'metro:babel-runtime',
+    babelRuntimeVersion: version,
+  });
+});
+
+test.each([false, '7.25.0'])(
+  "does not pass Metro's own Babel runtime when enableBabelRuntime is %p",
+  async enableBabelRuntime => {
+    const babelTransform = mockBabelTransformer();
+
+    await Transformer.transform(
+      {...baseConfig, enableBabelRuntime},
+      '/root',
+      'local/file.js',
+      Buffer.from('arbitrary(code)', 'utf8'),
+      baseTransformOptions,
+    );
+
+    const {options} = babelTransform.mock.calls[0][0];
+    expect(options).not.toHaveProperty('babelRuntimeModuleName');
+    expect(options).not.toHaveProperty('babelRuntimeVersion');
+  },
+);
 
 test('preserves require() calls when module wrapping is disabled', async () => {
   const contents = ['require("./c");'].join('\n');

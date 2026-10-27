@@ -37,7 +37,6 @@ jest
     endianness: () => 'LE',
     release: () => '',
   }))
-  .mock('graceful-fs', () => jest.requireMock('node:fs'))
   .spyOn(console, 'warn')
   .mockImplementation(() => {});
 
@@ -175,8 +174,12 @@ function dep(name: string): TransformResultDependency {
 
       jest.requireMock('node:os').tmpdir = () => p('/tmp');
 
-      // Node resolves Metro's own `@babel/runtime` to a path on the host,
-      // which is not valid for the platform under test.
+      // Node resolves Metro's own metro-runtime and `@babel/runtime` to paths
+      // on the host, which are not valid for the platform under test.
+      jest.doMock('../../lib/metroRuntime', () => ({
+        getMetroRuntimePackageJsonPath: () =>
+          p('/root/node_modules/metro-runtime/package.json'),
+      }));
       jest.doMock('../../lib/metroBabelRuntime', () => ({
         getMetroBabelRuntimePackageJsonPath: () =>
           p('/root/node_modules/@babel/runtime/package.json'),
@@ -1376,6 +1379,116 @@ function dep(name: string): TransformResultDependency {
         ).toEqual({
           type: 'sourceFile',
           filePath: p('/root/node_modules/aPackage/main-custom.js'),
+        });
+      });
+
+      // These pin which package's "browser" field applies to files reached
+      // through a symlink. A symlinked directory's target is checked before
+      // continuing up from the link's parent, and a symlinked file is scoped
+      // by where the link is. This behavior isn't covered by any spec.
+      //
+      // The tests map `.ios.js` files because a "browser" key for a `.js` or
+      // `.json` file also matches the extensionless path, which is redirected
+      // separately. Platform-specific keys are only matched per candidate
+      // extension.
+      describe('package scope of files reached through a symlink', () => {
+        test('a node_modules symlink to a package root', async () => {
+          setMockFileSystem({
+            'index.js': '',
+            store: {
+              deps: {
+                'package.json': JSON.stringify({
+                  name: 'deps',
+                  browser: {'./foo.ios.js': './foo-browser.js'},
+                }),
+                'foo.ios.js': '',
+                'foo-browser.js': '',
+              },
+            },
+          });
+          fs.symlinkSync(p('/root/store/deps'), p('/root/node_modules'));
+
+          resolver = await createResolver({}, 'ios');
+          expect(resolver.resolve(p('/root/index.js'), dep('foo'))).toEqual({
+            type: 'sourceFile',
+            filePath: p('/root/store/deps/foo-browser.js'),
+          });
+        });
+
+        test('a symlink to a node_modules directory', async () => {
+          setMockFileSystem({
+            'package.json': JSON.stringify({
+              name: 'app',
+              browser: {'./vendor/bar.ios.js': false},
+            }),
+            'index.js': '',
+            other: {node_modules: {'bar.ios.js': ''}},
+          });
+          fs.symlinkSync(p('/root/other/node_modules'), p('/root/vendor'));
+
+          resolver = await createResolver({}, 'ios');
+          expect(
+            resolver.resolve(p('/root/index.js'), dep('./vendor/bar')),
+          ).toEqual({
+            type: 'sourceFile',
+            filePath: p('/root/other/node_modules/bar.ios.js'),
+          });
+        });
+
+        test('a file symlink into another package, mapped by its target package', async () => {
+          setMockFileSystem({
+            'package.json': JSON.stringify({name: 'app'}),
+            'index.js': '',
+            other: {
+              pkg: {
+                'package.json': JSON.stringify({
+                  name: 'pkg',
+                  browser: {'./lib/foo.ios.js': './lib/foo-browser.js'},
+                }),
+                lib: {'foo.ios.js': '', 'foo-browser.js': ''},
+              },
+            },
+          });
+          fs.symlinkSync(
+            p('/root/other/pkg/lib/foo.ios.js'),
+            p('/root/foo.ios.js'),
+          );
+
+          resolver = await createResolver({}, 'ios');
+          expect(resolver.resolve(p('/root/index.js'), dep('./foo'))).toEqual({
+            type: 'sourceFile',
+            filePath: p('/root/other/pkg/lib/foo.ios.js'),
+          });
+        });
+
+        test('a file symlink into another package, mapped by the package of the link', async () => {
+          setMockFileSystem({
+            'package.json': JSON.stringify({
+              name: 'app',
+              browser: {'./foo.ios.js': false},
+            }),
+            'index.js': '',
+            'empty.js': '',
+            other: {
+              pkg: {
+                'package.json': JSON.stringify({name: 'pkg'}),
+                lib: {'foo.ios.js': ''},
+              },
+            },
+          });
+          fs.symlinkSync(
+            p('/root/other/pkg/lib/foo.ios.js'),
+            p('/root/foo.ios.js'),
+          );
+
+          resolver = await createResolver(
+            {resolver: {emptyModulePath: p('/root/empty.js')}},
+            'ios',
+          );
+          expect(resolver.resolve(p('/root/index.js'), dep('./foo'))).toEqual({
+            type: 'sourceFile',
+            filePath: p('/root/empty.js'),
+          });
         });
       });
     });

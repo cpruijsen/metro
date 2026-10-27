@@ -39,6 +39,19 @@ function isRegularFile(node: FileNode): boolean {
   return node[H.SYMLINK] === 0;
 }
 
+// Null if not within the ancestor ('' is the root).
+function relativeToAncestor(
+  normalPath: string,
+  ancestorNormalPath: string,
+): ?string {
+  if (ancestorNormalPath === '' || normalPath === ancestorNormalPath) {
+    return ancestorNormalPath === '' ? normalPath : '';
+  }
+  return normalPath.startsWith(ancestorNormalPath + path.sep)
+    ? normalPath.slice(ancestorNormalPath.length + 1)
+    : null;
+}
+
 type DeserializedSnapshotInput = {
   rootDir: string,
   fileSystemData: DirectoryNode,
@@ -248,7 +261,10 @@ export default class TreeFS implements MutableFileSystem {
     // If a subpath is specified, start iteration from that node
     let rootNode: DirectoryNode = this.#rootNode;
     let prefix: string = '';
-    if (subpath != null && subpath !== '') {
+    if (subpath === '') {
+      // '..' holds files outside rootDir, which are not under this subpath
+      rootNode = new Map([...this.#rootNode].filter(([name]) => name !== '..'));
+    } else if (subpath != null) {
       const lookupResult = this.#lookupByNormalPath(subpath, {
         followLeaf: false,
       });
@@ -653,9 +669,9 @@ export default class TreeFS implements MutableFileSystem {
       // traversal, useful when adding files. Will throw if an expected
       // directory is already present as a file.
       makeDirectories?: boolean,
-      startPathIdx?: number,
-      startNode?: DirectoryNode,
-      start?: {
+      // Resume traversal from a known directory node, whose normal path is
+      // the prefix of the requested path ending at pathIdx - 1.
+      start?: ?{
         ancestorOfRootIdx: ?number,
         node: DirectoryNode,
         pathIdx: number,
@@ -921,6 +937,10 @@ export default class TreeFS implements MutableFileSystem {
    *   X = dirname(X)
    * while X !== dirname(X)
    *
+   * Each candidate is checked from its own node: a subpath that is a single
+   * path segment, such as `package.json`, with one map lookup, and a deeper
+   * subpath by traversing only the subpath.
+   *
    * If `observations` is given, records the canonical paths this result
    * depends upon.
    *
@@ -940,6 +960,13 @@ export default class TreeFS implements MutableFileSystem {
     absolutePath: string,
     containerRelativePath: string,
   } {
+    // Only a single path segment (e.g. `package.json`, but not
+    // `node_modules/pkg`) can be looked up on a candidate's own node.
+    const isBasename =
+      subpath !== '' &&
+      subpath !== '.' &&
+      subpath !== '..' &&
+      !subpath.includes(path.sep);
     const ancestorsOfInput: Array<{
       ancestorOfRootIdx: ?number,
       node: DirectoryNode,
@@ -958,7 +985,11 @@ export default class TreeFS implements MutableFileSystem {
         subpath,
         opts.subpathType,
         observations,
-        null,
+        {
+          ancestorOfRootIdx: closestLookup.ancestorOfRootIdx,
+          node: closestLookup.node,
+        },
+        isBasename,
       );
       if (maybeAbsolutePathMatch != null) {
         return {
@@ -1031,14 +1062,8 @@ export default class TreeFS implements MutableFileSystem {
         subpath,
         opts.subpathType,
         observations,
-        {
-          ancestorOfRootIdx: candidate.ancestorOfRootIdx,
-          node: candidate.node,
-          pathIdx:
-            candidate.normalPath.length > 0
-              ? candidate.normalPath.length + 1
-              : 0,
-        },
+        candidate,
+        isBasename,
       );
       if (maybeAbsolutePathMatch != null) {
         // Determine the input path relative to the current candidate. Note
@@ -1066,8 +1091,26 @@ export default class TreeFS implements MutableFileSystem {
 
     // This will be '', '..', '../..', etc.
     let candidateNormalPath =
-      commonRootDepth > 0 ? normalPath.slice(0, 3 * commonRootDepth - 1) : '';
-    const remainingNormalPath = normalPath.slice(commonRootDepth * 3);
+      commonRootDepth > 0
+        ? '..' + (path.sep + '..').repeat(commonRootDepth - 1)
+        : '';
+    // By its real path, if the start path reaches the common root through a
+    // symlink.
+    const remainingNormalPath =
+      relativeToAncestor(normalPath, candidateNormalPath) ??
+      relativeToAncestor(
+        closestLookup.exists
+          ? closestLookup.canonicalPath
+          : closestLookup.remainingPath === ''
+            ? closestLookup.canonicalMissingPath
+            : closestLookup.canonicalMissingPath +
+              path.sep +
+              closestLookup.remainingPath,
+        candidateNormalPath,
+      );
+    if (remainingNormalPath == null) {
+      return null;
+    }
 
     let nextNode: ?MixedNode = commonRoot;
     let depthBelowCommonRoot = 0;
@@ -1078,7 +1121,11 @@ export default class TreeFS implements MutableFileSystem {
         subpath,
         opts.subpathType,
         observations,
-        null,
+        {
+          ancestorOfRootIdx: commonRootDepth + depthBelowCommonRoot,
+          node: nextNode,
+        },
+        isBasename,
       );
       if (maybeAbsolutePathMatch != null) {
         const rootDirParts = this.#pathUtils.getParts();
@@ -1107,24 +1154,74 @@ export default class TreeFS implements MutableFileSystem {
     return null;
   }
 
+  /**
+   * Whether the real directory at `normalCandidatePath` has `subpath` of the
+   * given type, returning the absolute real path of the match.
+   *
+   * `candidate` is the directory node at `normalCandidatePath`. When
+   * `isBasename` and the candidate is the root or a descendant of it, the
+   * child is checked with one map lookup. An ancestor of the root is
+   * traversed instead, because its node does not hold the segment leading
+   * back towards the root. Otherwise, traversal starts from the candidate.
+   */
   #checkCandidateHasSubpath(
     normalCandidatePath: string,
     subpath: string,
     subpathType: 'f' | 'd',
     observations: ?Observations,
-    start: ?{
-      ancestorOfRootIdx: ?number,
-      node: DirectoryNode,
-      pathIdx: number,
+    candidate: {
+      readonly ancestorOfRootIdx: ?number,
+      readonly node: DirectoryNode,
+      ...
     },
+    isBasename: boolean,
   ): ?string {
-    const lookupResult = this.#lookupByNormalPath(
-      this.#pathUtils.joinNormalToRelative(normalCandidatePath, subpath)
-        .normalPath,
-      {
-        observations,
-      },
-    );
+    if (
+      isBasename &&
+      (candidate.ancestorOfRootIdx == null || candidate.ancestorOfRootIdx === 0)
+    ) {
+      const childNode = candidate.node.get(subpath);
+      // A symlink must be traversed to learn its type and real path, so only
+      // a missing child, a directory or a regular file is answered here.
+      if (
+        childNode == null ||
+        isDirectory(childNode) ||
+        isRegularFile(childNode)
+      ) {
+        const isMatch =
+          childNode != null && isDirectory(childNode) === (subpathType === 'd');
+        if (!isMatch && observations == null) {
+          return null;
+        }
+        const childNormalPath =
+          normalCandidatePath === ''
+            ? subpath
+            : normalCandidatePath + path.sep + subpath;
+        if (observations) {
+          observations.existence.add(childNormalPath);
+        }
+        return isMatch
+          ? this.#pathUtils.normalToAbsolute(childNormalPath)
+          : null;
+      }
+    }
+    const {normalPath: normalSubpath, collapsedSegments} =
+      this.#pathUtils.joinNormalToRelative(normalCandidatePath, subpath);
+    const lookupResult = this.#lookupByNormalPath(normalSubpath, {
+      observations,
+      // Traverse only the subpath, starting from the candidate node. If the
+      // join collapsed segments (e.g. '..' + 'root/package.json'), the
+      // candidate path is no longer a prefix, so start from the root.
+      start:
+        collapsedSegments === 0
+          ? {
+              ancestorOfRootIdx: candidate.ancestorOfRootIdx,
+              node: candidate.node,
+              pathIdx:
+                normalCandidatePath === '' ? 0 : normalCandidatePath.length + 1,
+            }
+          : null,
+    });
     if (
       lookupResult.exists &&
       // Should be a Map iff subpathType is directory
